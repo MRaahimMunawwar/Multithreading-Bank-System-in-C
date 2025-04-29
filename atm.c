@@ -12,7 +12,7 @@ int main() {
     char buffer[MAX_MSG_SIZE];
     int choice, account_index, amount, to_account;
 
-    // Connect to bank server through FIFO
+    
     printf("[*] ATM started. Connecting to Bank...\n");
 
     fd = open(FIFO_PATH, O_WRONLY);
