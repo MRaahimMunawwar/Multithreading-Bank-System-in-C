@@ -1,161 +1,111 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <semaphore.h>
+#include <pthread.h>
 #include <fcntl.h>
-#include <sys/stat.h>
+#include <unistd.h>
 
-#define FIFO_NAME "bank_fifo"
+#define FIFO_PATH "/tmp/bank_fifo"
 #define MAX_MSG_SIZE 256
-#define MAX_ACCOUNTS 100
 
 typedef struct {
-    int id;
     int balance;
+    int pin;  // Added pin for account
+    int is_deleted;  // Flag to check if the account is deleted
 } Account;
 
-Account accounts[MAX_ACCOUNTS];
-int account_count = 0;
-sem_t bank_sem;
+Account accounts[5];  // Supporting 5 accounts
+sem_t mutex;  // Semaphore to ensure mutual exclusion during account access
 
-void create_account() {
-    if (account_count >= MAX_ACCOUNTS) {
-        printf("[!] Cannot create more accounts.\n");
-        return;
+void initialize_accounts() {
+    for (int i = 0; i < 5; i++) {
+        accounts[i].balance = 1000;
+        accounts[i].pin = 1234;  // Default PIN for simplicity
+        accounts[i].is_deleted = 0;  // Initially, accounts are not deleted
     }
-    sem_wait(&bank_sem);
-    accounts[account_count].id = account_count;
-    accounts[account_count].balance = 0;
-    printf("[✓] Account[%d] created with balance $0\n", account_count);
-    account_count++;
-    sem_post(&bank_sem);
 }
 
-int get_account_index(int id) {
-    if (id < 0 || id >= account_count) return -1;
-    return id;
-}
+void handle_request(char* request) {
+    int account_index, amount, pin, entered_pin;
+    char action[20];
+    
+    sscanf(request, "%d %s %d", &account_index, action, &amount);
 
-void deposit(int id, int amount) {
-    if (amount < 0) {
-        printf("[!] Deposit failed: Negative amount.\n");
-        return;
-    }
-    int idx = get_account_index(id);
-    if (idx == -1) {
-        printf("[!] Invalid account ID.\n");
+    if (account_index < 0 || account_index >= 5 || accounts[account_index].is_deleted) {
+        printf("[!] Invalid account or account is deleted.\n");
         return;
     }
 
-    sem_wait(&bank_sem);
-    accounts[idx].balance += amount;
-    printf("[✓] Deposited $%d to Account[%d]. New Balance: $%d\n", amount, id, accounts[idx].balance);
-    sem_post(&bank_sem);
-}
-
-void withdraw(int id, int amount) {
-    if (amount < 0) {
-        printf("[!] Withdrawal failed: Negative amount.\n");
-        return;
-    }
-    int idx = get_account_index(id);
-    if (idx == -1) {
-        printf("[!] Invalid account ID.\n");
-        return;
+    if (strcmp(action, "pin") == 0) {  // Authenticate PIN
+        sscanf(request, "pin %d", &entered_pin);
+        if (entered_pin == accounts[account_index].pin) {
+            printf("[*] Authentication successful for Account[%d].\n", account_index);
+        } else {
+            printf("[!] Invalid PIN.\n");
+        }
     }
 
-    sem_wait(&bank_sem);
-    if (accounts[idx].balance >= amount) {
-        accounts[idx].balance -= amount;
-        printf("[✓] Withdrew $%d from Account[%d]. New Balance: $%d\n", amount, id, accounts[idx].balance);
-    } else {
-        printf("[!] Withdrawal failed: Insufficient funds in Account[%d].\n", id);
-    }
-    sem_post(&bank_sem);
-}
+    if (strcmp(action, "deposit") == 0) {
+        accounts[account_index].balance += amount;
+        printf("[+] Deposited $%d into Account[%d]. New Balance: $%d\n", amount, account_index, accounts[account_index].balance);
+    } else if (strcmp(action, "withdraw") == 0) {
+        if (accounts[account_index].balance >= amount) {
+            accounts[account_index].balance -= amount;
+            printf("[+] Withdrew $%d from Account[%d]. New Balance: $%d\n", amount, account_index, accounts[account_index].balance);
+        } else {
+            printf("[!] Insufficient funds for Account[%d]\n", account_index);
+        }
+    } else if (strcmp(action, "view") == 0) {
+        printf("[*] Account[%d] Balance: $%d\n", account_index, accounts[account_index].balance);
+    } else if (strcmp(action, "transfer") == 0) {
+        int to_account;
+        sscanf(request, "%d %*s %d %d", &account_index, &amount, &to_account);
+        if (to_account < 0 || to_account >= 5 || to_account == account_index) {
+            printf("[!] Invalid target account: %d\n", to_account);
+            return;
+        }
 
-void view_balance(int id) {
-    int idx = get_account_index(id);
-    if (idx == -1) {
-        printf("[!] Invalid account ID.\n");
-        return;
-    }
-
-    sem_wait(&bank_sem);
-    printf("[*] Account[%d] Balance: $%d\n", id, accounts[idx].balance);
-    sem_post(&bank_sem);
-}
-
-void transfer(int from, int to, int amount) {
-    if (amount < 0) {
-        printf("[!] Transfer failed: Negative amount.\n");
-        return;
-    }
-    int idx1 = get_account_index(from);
-    int idx2 = get_account_index(to);
-    if (idx1 == -1 || idx2 == -1 || from == to) {
-        printf("[!] Invalid transfer accounts.\n");
-        return;
-    }
-
-    sem_wait(&bank_sem);
-    if (accounts[idx1].balance >= amount) {
-        accounts[idx1].balance -= amount;
-        accounts[idx2].balance += amount;
-        printf("[✓] Transferred $%d from Account[%d] to Account[%d]\n", amount, from, to);
-    } else {
-        printf("[!] Transfer failed: Insufficient funds in Account[%d].\n", from);
-    }
-    sem_post(&bank_sem);
-}
-
-void handle_command(char* msg) {
-    char cmd[20];
-    int id1, id2, amount;
-
-    if (strncmp(msg, "create", 6) == 0) {
-        create_account();
-    } else if (sscanf(msg, "%d deposit %d", &id1, &amount) == 2) {
-        deposit(id1, amount);
-    } else if (sscanf(msg, "%d withdraw %d", &id1, &amount) == 2) {
-        withdraw(id1, amount);
-    } else if (sscanf(msg, "%d view", &id1) == 1) {
-        view_balance(id1);
-    } else if (sscanf(msg, "%d transfer %d %d", &id1, &amount, &id2) == 3) {
-        transfer(id1, id2, amount);
-    } else {
-        printf("[!] Invalid command received: %s\n", msg);
+        if (accounts[account_index].balance >= amount) {
+            accounts[account_index].balance -= amount;
+            accounts[to_account].balance += amount;
+            printf("[*] Transferred $%d from Account[%d] to Account[%d]\n", amount, account_index, to_account);
+        } else {
+            printf("[!] Insufficient funds for transfer from Account[%d]\n", account_index);
+        }
+    } else if (strcmp(action, "delete") == 0) {
+        accounts[account_index].balance = 0;
+        accounts[account_index].is_deleted = 1;
+        printf("[*] Account[%d] has been deleted.\n", account_index);
     }
 }
 
 int main() {
     char buffer[MAX_MSG_SIZE];
+    int fd;
 
-    mkfifo(FIFO_NAME, 0666);
-    sem_init(&bank_sem, 0, 1);
-
-    printf("[*] Bank Server Started. Waiting for ATM commands...\n");
-
-    int fd = open(FIFO_NAME, O_RDONLY);
+    fd = open(FIFO_PATH, O_RDONLY);
     if (fd == -1) {
         perror("open FIFO");
-        return 1;
+        exit(1);
     }
 
+    sem_init(&mutex, 0, 1);
+    initialize_accounts();
+
+    printf("[*] Bank Server Started.\n");
+
     while (1) {
-        ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
-        if (n > 0) {
-            buffer[n] = '\0';
-            handle_command(buffer);
-        } else {
-            sleep(1);
+        ssize_t bytes_read = read(fd, buffer, MAX_MSG_SIZE);
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+            sem_wait(&mutex);
+            handle_request(buffer);
+            sem_post(&mutex);
         }
     }
 
     close(fd);
-    unlink(FIFO_NAME);
-    sem_destroy(&bank_sem);
+    sem_destroy(&mutex);
     return 0;
 }
