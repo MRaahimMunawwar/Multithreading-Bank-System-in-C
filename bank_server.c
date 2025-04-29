@@ -37,6 +37,11 @@ typedef struct {
 
 // Function to create a new account
 int create_account(int pin) {
+    // Validate PIN (should be a 4-digit number)
+    if (pin < 1000 || pin > 9999) {
+        return -2;  // Invalid PIN
+    }
+    
     pthread_mutex_lock(&accounts_mutex);
     
     if (account_count >= MAX_ACCOUNTS) {
@@ -84,11 +89,18 @@ void handle_request(char *request) {
     
     // Parse create account request
     if (strncmp(request, "create", 6) == 0) {
-        sscanf(request, "create %d", &pin);
+        if (sscanf(request, "create %d", &pin) != 1) {
+            snprintf(response, MAX_RESPONSE_SIZE, "Invalid create account request format");
+            send_response(response);
+            return;
+        }
+        
         int new_account = create_account(pin);
         
         if (new_account >= 0) {
             snprintf(response, MAX_RESPONSE_SIZE, "Account %d created successfully with PIN %d", new_account, pin);
+        } else if (new_account == -2) {
+            snprintf(response, MAX_RESPONSE_SIZE, "Invalid PIN. PIN must be a 4-digit number.");
         } else {
             snprintf(response, MAX_RESPONSE_SIZE, "Failed to create account. Maximum limit reached.");
         }
@@ -108,9 +120,16 @@ void handle_request(char *request) {
     
     // Validate account number
     pthread_mutex_lock(&accounts_mutex);
-    if (account_num < 0 || account_num >= account_count) {
+    if (account_num < 0) {
         pthread_mutex_unlock(&accounts_mutex);
-        snprintf(response, MAX_RESPONSE_SIZE, "Invalid account number: %d", account_num);
+        snprintf(response, MAX_RESPONSE_SIZE, "Invalid account number: Account numbers cannot be negative");
+        send_response(response);
+        return;
+    }
+    
+    if (account_num >= account_count) {
+        pthread_mutex_unlock(&accounts_mutex);
+        snprintf(response, MAX_RESPONSE_SIZE, "Account %d does not exist", account_num);
         send_response(response);
         return;
     }
@@ -294,6 +313,8 @@ void signal_handler(int sig) {
         // Destroy mutexes and semaphores
         pthread_mutex_destroy(&accounts_mutex);
         sem_destroy(&request_sem);
+        
+        printf("Cleanup complete. Exiting now.\n");
         
         // Exit
         exit(0);
