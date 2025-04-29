@@ -1,178 +1,161 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <pthread.h>
 #include <semaphore.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <mqueue.h>
-#include <unistd.h>
-#include <pthread.h>
 
-#define QUEUE_NAME "/bank_queue"
+#define FIFO_NAME "bank_fifo"
 #define MAX_MSG_SIZE 256
-#define ACCOUNT_COUNT 5
+#define MAX_ACCOUNTS 100
 
 typedef struct {
+    int id;
     int balance;
 } Account;
 
-Account accounts[ACCOUNT_COUNT];
-sem_t counter_sem;
-sem_t account_sems[ACCOUNT_COUNT];
+Account accounts[MAX_ACCOUNTS];
+int account_count = 0;
+sem_t bank_sem;
 
-void initialize_accounts() {
-    for (int i = 0; i < ACCOUNT_COUNT; i++) {
-        accounts[i].balance = 1000;
-        sem_init(&account_sems[i], 0, 1);
+void create_account() {
+    if (account_count >= MAX_ACCOUNTS) {
+        printf("[!] Cannot create more accounts.\n");
+        return;
     }
+    sem_wait(&bank_sem);
+    accounts[account_count].id = account_count;
+    accounts[account_count].balance = 0;
+    printf("[✓] Account[%d] created with balance $0\n", account_count);
+    account_count++;
+    sem_post(&bank_sem);
 }
 
-void* thread_handle_message(void* arg) {
-    char* msg = (char*)arg;
-    // Process the message
-    handle_message(msg);
-    free(msg);
-    return NULL;
+int get_account_index(int id) {
+    if (id < 0 || id >= account_count) return -1;
+    return id;
 }
 
-void process_transaction(char *action, int account_index, int amount) {
+void deposit(int id, int amount) {
     if (amount < 0) {
-        printf("[!] Transaction failed: Negative amount not allowed.\n");
+        printf("[!] Deposit failed: Negative amount.\n");
+        return;
+    }
+    int idx = get_account_index(id);
+    if (idx == -1) {
+        printf("[!] Invalid account ID.\n");
         return;
     }
 
-    sem_wait(&counter_sem);
-
-    if (strcmp(action, "deposit") == 0) {
-        accounts[account_index].balance += amount;
-        printf("[✓] Deposited $%d to Account[%d]. New Balance: $%d\n",
-               amount, account_index, accounts[account_index].balance);
-    } else if (strcmp(action, "withdraw") == 0) {
-        if (accounts[account_index].balance >= amount) {
-            accounts[account_index].balance -= amount;
-            printf("[✓] Withdrew $%d from Account[%d]. New Balance: $%d\n",
-                   amount, account_index, accounts[account_index].balance);
-        } else {
-            printf("[!] Withdrawal failed: Insufficient funds in Account[%d].\n", account_index);
-        }
-    }
-
-    sem_post(&counter_sem);
+    sem_wait(&bank_sem);
+    accounts[idx].balance += amount;
+    printf("[✓] Deposited $%d to Account[%d]. New Balance: $%d\n", amount, id, accounts[idx].balance);
+    sem_post(&bank_sem);
 }
 
-void handle_message(char *message) {
-    if (strcmp(message, "exit") == 0) {
-        printf("[*] ATM requested shutdown. Exiting...\n");
-        exit(0);
+void withdraw(int id, int amount) {
+    if (amount < 0) {
+        printf("[!] Withdrawal failed: Negative amount.\n");
+        return;
     }
-
-    char action[20];
-    int account_index, amount, to_account;
-
-    if (strstr(message, "transfer") != NULL) {
-        // Format: <from> transfer <amount> <to>
-        sscanf(message, "%d %s %d %d", &account_index, action, &amount, &to_account);
-
-        if (amount < 0) {
-            printf("[!] Transfer failed: Negative amount not allowed.\n");
-            return;
-        }
-
-        if (account_index < 0 || account_index >= ACCOUNT_COUNT ||
-            to_account < 0 || to_account >= ACCOUNT_COUNT || account_index == to_account) {
-            printf("[!] Invalid transfer accounts.\n");
-            return;
-        }
-
-        int first = account_index < to_account ? account_index : to_account;
-        int second = account_index < to_account ? to_account : account_index;
-
-        sem_wait(&account_sems[first]);
-        sleep(1); // Simulate processing
-        sem_wait(&account_sems[second]);
-
-        if (accounts[account_index].balance >= amount) {
-            accounts[account_index].balance -= amount;
-            accounts[to_account].balance += amount;
-            printf("[✓] Transferred $%d from Account[%d] to Account[%d].\n",
-                   amount, account_index, to_account);
-        } else {
-            printf("[!] Transfer failed: Insufficient funds in Account[%d].\n", account_index);
-        }
-
-        sem_post(&account_sems[second]);
-        sem_post(&account_sems[first]);
-
+    int idx = get_account_index(id);
+    if (idx == -1) {
+        printf("[!] Invalid account ID.\n");
         return;
     }
 
-    // Handle deposit, withdraw, view
-    if (sscanf(message, "%d %s %d", &account_index, action, &amount) < 2) {
-        printf("[!] Invalid message format.\n");
-        return;
-    }
-
-    if (account_index < 0 || account_index >= ACCOUNT_COUNT) {
-        printf("[!] Invalid account index: %d\n", account_index);
-        return;
-    }
-
-    if (strcmp(action, "view") == 0) {
-        sem_wait(&counter_sem);
-        printf("[*] Account[%d] Balance: $%d\n", account_index, accounts[account_index].balance);
-        sem_post(&counter_sem);
+    sem_wait(&bank_sem);
+    if (accounts[idx].balance >= amount) {
+        accounts[idx].balance -= amount;
+        printf("[✓] Withdrew $%d from Account[%d]. New Balance: $%d\n", amount, id, accounts[idx].balance);
     } else {
-        process_transaction(action, account_index, amount);
+        printf("[!] Withdrawal failed: Insufficient funds in Account[%d].\n", id);
+    }
+    sem_post(&bank_sem);
+}
+
+void view_balance(int id) {
+    int idx = get_account_index(id);
+    if (idx == -1) {
+        printf("[!] Invalid account ID.\n");
+        return;
+    }
+
+    sem_wait(&bank_sem);
+    printf("[*] Account[%d] Balance: $%d\n", id, accounts[idx].balance);
+    sem_post(&bank_sem);
+}
+
+void transfer(int from, int to, int amount) {
+    if (amount < 0) {
+        printf("[!] Transfer failed: Negative amount.\n");
+        return;
+    }
+    int idx1 = get_account_index(from);
+    int idx2 = get_account_index(to);
+    if (idx1 == -1 || idx2 == -1 || from == to) {
+        printf("[!] Invalid transfer accounts.\n");
+        return;
+    }
+
+    sem_wait(&bank_sem);
+    if (accounts[idx1].balance >= amount) {
+        accounts[idx1].balance -= amount;
+        accounts[idx2].balance += amount;
+        printf("[✓] Transferred $%d from Account[%d] to Account[%d]\n", amount, from, to);
+    } else {
+        printf("[!] Transfer failed: Insufficient funds in Account[%d].\n", from);
+    }
+    sem_post(&bank_sem);
+}
+
+void handle_command(char* msg) {
+    char cmd[20];
+    int id1, id2, amount;
+
+    if (strncmp(msg, "create", 6) == 0) {
+        create_account();
+    } else if (sscanf(msg, "%d deposit %d", &id1, &amount) == 2) {
+        deposit(id1, amount);
+    } else if (sscanf(msg, "%d withdraw %d", &id1, &amount) == 2) {
+        withdraw(id1, amount);
+    } else if (sscanf(msg, "%d view", &id1) == 1) {
+        view_balance(id1);
+    } else if (sscanf(msg, "%d transfer %d %d", &id1, &amount, &id2) == 3) {
+        transfer(id1, id2, amount);
+    } else {
+        printf("[!] Invalid command received: %s\n", msg);
     }
 }
 
 int main() {
-    mqd_t mq;
-    struct mq_attr attr;
     char buffer[MAX_MSG_SIZE];
 
-    attr.mq_flags = 0;
-    attr.mq_maxmsg = 10;
-    attr.mq_msgsize = MAX_MSG_SIZE;
-    attr.mq_curmsgs = 0;
+    mkfifo(FIFO_NAME, 0666);
+    sem_init(&bank_sem, 0, 1);
 
-    mq_unlink(QUEUE_NAME); // Clear old queue
+    printf("[*] Bank Server Started. Waiting for ATM commands...\n");
 
-    mq = mq_open(QUEUE_NAME, O_CREAT | O_RDONLY, 0644, &attr);
-    if (mq == -1) {
-        perror("mq_open (bank)");
-        exit(EXIT_FAILURE);
+    int fd = open(FIFO_NAME, O_RDONLY);
+    if (fd == -1) {
+        perror("open FIFO");
+        return 1;
     }
 
-    sem_init(&counter_sem, 0, 1);
-    initialize_accounts();
-
-    printf("[*] Bank Server Started.\n");
-
     while (1) {
-        ssize_t bytes_read = mq_receive(mq, buffer, MAX_MSG_SIZE, NULL);
-        if (bytes_read >= 0) {
-            buffer[bytes_read] = '\0';
-            char* msg_copy = strdup(buffer);
-            pthread_t tid;
-            if (pthread_create(&tid, NULL, thread_handle_message, msg_copy) == 0) {
-                pthread_detach(tid);
-            } else {
-                perror("pthread_create");
-                free(msg_copy);
-            }
+        ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+        if (n > 0) {
+            buffer[n] = '\0';
+            handle_command(buffer);
         } else {
-            perror("mq_receive (bank)");
             sleep(1);
         }
     }
 
-    mq_close(mq);
-    mq_unlink(QUEUE_NAME);
-    sem_destroy(&counter_sem);
-    for (int i = 0; i < ACCOUNT_COUNT; i++) {
-        sem_destroy(&account_sems[i]);
-    }
-
+    close(fd);
+    unlink(FIFO_NAME);
+    sem_destroy(&bank_sem);
     return 0;
 }

@@ -1,101 +1,108 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <mqueue.h>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <pthread.h>
 
-#define QUEUE_NAME "/bank_queue"
+#define FIFO_PATH "/tmp/bank_fifo"
 #define MAX_MSG_SIZE 256
 
-void* atm_user_session(void* arg) {
-    mqd_t mq;
+int main() {
+    int fd;
     char buffer[MAX_MSG_SIZE];
-    int choice, account_index, amount;
-    int user_id = *(int*)arg;
+    int choice, account_index, amount, to_account;
 
-    mq = mq_open(QUEUE_NAME, O_WRONLY);
-    if (mq == -1) {
-        perror("mq_open (ATM)");
-        pthread_exit(NULL);
+    // Connect to bank server through FIFO
+    printf("[*] ATM started. Connecting to Bank...\n");
+
+    fd = open(FIFO_PATH, O_WRONLY);
+    if (fd == -1) {
+        perror("open FIFO");
+        exit(1);
     }
 
-    printf("[*] User %d: ATM Connected to Bank.\n", user_id);
-
     while (1) {
-        printf("\n=== ATM Menu (User %d) ===\n", user_id);
-        printf("1. Deposit\n");
-        printf("2. Withdraw\n");
-        printf("3. View Balance\n");
-        printf("4. Transfer\n");
-        printf("5. Exit\n");
+        printf("\n=== ATM Menu ===\n");
+        printf("1. Open New Account\n");
+        printf("2. Deposit\n");
+        printf("3. Withdraw\n");
+        printf("4. View Balance\n");
+        printf("5. Transfer\n");
+        printf("6. Exit\n");
         printf("Select option: ");
         scanf("%d", &choice);
 
-        if (choice == 5) {
-            printf("[*] User %d: ATM exiting...\n", user_id);
-            break;
-        }
-
-        printf("Enter account index (0–4): ");
-        scanf("%d", &account_index);
-
-        if (account_index < 0 || account_index > 4) {
-            printf("[!] Invalid account index.\n");
-            continue;
-        }
-
         switch (choice) {
-            case 1: // Deposit
+            case 1:
+                snprintf(buffer, sizeof(buffer), "new_account");
+                break;
+
+            case 2:
+                printf("Enter account index: ");
+                scanf("%d", &account_index);
                 printf("Enter deposit amount: ");
                 scanf("%d", &amount);
+                if (amount < 0) {
+                    printf("[!] Amount cannot be negative.\n");
+                    continue;
+                }
                 snprintf(buffer, sizeof(buffer), "%d deposit %d", account_index, amount);
                 break;
 
-            case 2: // Withdraw
+            case 3:
+                printf("Enter account index: ");
+                scanf("%d", &account_index);
                 printf("Enter withdraw amount: ");
                 scanf("%d", &amount);
+                if (amount < 0) {
+                    printf("[!] Amount cannot be negative.\n");
+                    continue;
+                }
                 snprintf(buffer, sizeof(buffer), "%d withdraw %d", account_index, amount);
                 break;
 
-            case 3: // View balance
-                snprintf(buffer, sizeof(buffer), "%d view 0", account_index);
+            case 4:
+                printf("Enter account index: ");
+                scanf("%d", &account_index);
+                snprintf(buffer, sizeof(buffer), "%d view", account_index);
                 break;
 
-            case 4: { // Transfer
-                int to_account;
-                printf("Enter target account index (0–4): ");
+            case 5:
+                printf("Enter source account index: ");
+                scanf("%d", &account_index);
+                printf("Enter target account index: ");
                 scanf("%d", &to_account);
-                if (to_account < 0 || to_account > 4 || to_account == account_index) {
-                    printf("[!] Invalid target account.\n");
+                if (to_account == account_index) {
+                    printf("[!] Cannot transfer to same account.\n");
                     continue;
                 }
                 printf("Enter transfer amount: ");
                 scanf("%d", &amount);
+                if (amount < 0) {
+                    printf("[!] Amount cannot be negative.\n");
+                    continue;
+                }
                 snprintf(buffer, sizeof(buffer), "%d transfer %d %d", account_index, amount, to_account);
                 break;
-            }
+
+            case 6:
+                printf("[*] Exiting ATM...\n");
+                close(fd);
+                return 0;
 
             default:
                 printf("[!] Invalid option.\n");
                 continue;
         }
 
-        if (mq_send(mq, buffer, strlen(buffer) + 1, 0) == -1) {
-            perror("mq_send (ATM)");
+        // Write message to FIFO
+        if (write(fd, buffer, strlen(buffer) + 1) == -1) {
+            perror("write");
         } else {
-            printf("[*] Request sent to Bank Server.\n");
+            printf("[*] Request sent to bank: %s\n", buffer);
         }
     }
 
-    mq_close(mq);
-    pthread_exit(NULL);
-}
-
-int main() {
-    int user_id = getpid(); // Use PID as user ID
-    atm_user_session(&user_id);
+    close(fd);
     return 0;
 }
