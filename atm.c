@@ -1,372 +1,266 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <semaphore.h>
+#include <mqueue.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <errno.h>
-#include <signal.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <ctype.h>
 
-#define REQUEST_FIFO "/tmp/bank_request_fifo"
-#define RESPONSE_FIFO "/tmp/bank_response_fifo"
+#define QUEUE_NAME "/bank_queue"
 #define MAX_MSG_SIZE 256
-#define MAX_RESPONSE_SIZE 256
+#define PIN_LENGTH 4
+#define DOB_LENGTH 11 // Format: DD/MM/YYYY\0
 
-// Structure to pass data to thread
-typedef struct {
-    int thread_id;
-} ThreadData;
+void clear_input_buffer()
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF)
+        ;
+}
 
-// Global semaphores and mutex
-sem_t request_mutex;  // Mutex for request FIFO access
-sem_t response_sem;   // Semaphore to signal response availability
-pthread_mutex_t io_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex for console I/O
+bool validate_pin(const char *pin)
+{
+    if (strlen(pin) != PIN_LENGTH)
+        return false;
+    for (int i = 0; i < PIN_LENGTH; i++)
+    {
+        if (!isdigit(pin[i]))
+            return false;
+    }
+    return true;
+}
 
-// Function to read response from the response FIFO
-void read_response() {
-    int fd_response;
-    char response[MAX_RESPONSE_SIZE];
-    
-    // Open response FIFO
-    fd_response = open(RESPONSE_FIFO, O_RDONLY);
-    if (fd_response == -1) {
-        perror("Failed to open response FIFO");
+bool validate_dob(const char *dob)
+{
+    if (strlen(dob) != 10 || dob[2] != '/' || dob[5] != '/')
+        return false;
+
+    for (int i = 0; i < 10; i++)
+    {
+        if (i == 2 || i == 5)
+            continue;
+        if (!isdigit(dob[i]))
+            return false;
+    }
+
+    int day = (dob[0] - '0') * 10 + (dob[1] - '0');
+    int month = (dob[3] - '0') * 10 + (dob[4] - '0');
+    int year = (dob[6] - '0') * 1000 + (dob[7] - '0') * 100 +
+               (dob[8] - '0') * 10 + (dob[9] - '0');
+
+    if (month < 1 || month > 12 || day < 1 || day > 31)
+        return false;
+    if (year < 1900 || year > 2100)
+        return false;
+
+    return true;
+}
+
+void print_menu(int user_id)
+{
+    printf("\n=============================\n");
+    printf("=== ATM Menu (User %d) ===\n", user_id);
+    printf("=============================\n");
+    printf("1. Deposit\n");
+    printf("2. Withdraw\n");
+    printf("3. View Account\n");
+    printf("4. Transfer\n");
+    printf("5. Change PIN\n");
+    printf("6. Change DOB\n");
+    printf("7. Exit\n");
+    printf("-----------------------------\n");
+    printf("Select option: ");
+}
+
+void send_request(mqd_t mq, const char *request)
+{
+    printf("[*] Sending: %s\n", request);
+    if (mq_send(mq, request, strlen(request) + 1, 0) == -1)
+    {
+        perror("[ERROR] mq_send failed");
+    }
+    else
+    {
+        printf("[*] Request sent successfully\n");
+    }
+}
+
+void atm_session(int user_id)
+{
+    mqd_t mq = mq_open(QUEUE_NAME, O_WRONLY);
+    if (mq == -1)
+    {
+        perror("[ERROR] mq_open failed");
         return;
     }
-    
-    // Read response
-    ssize_t bytes_read = read(fd_response, response, MAX_RESPONSE_SIZE - 1);
-    if (bytes_read > 0) {
-        response[bytes_read] = '\0';
-        pthread_mutex_lock(&io_mutex);
-        printf("\n[SERVER RESPONSE] %s\n", response);
-        pthread_mutex_unlock(&io_mutex);
-    } else {
-        pthread_mutex_lock(&io_mutex);
-        printf("\n[ERROR] Failed to read response\n");
-        pthread_mutex_unlock(&io_mutex);
-    }
-    
-    close(fd_response);
-}
 
-// Function to validate numeric input
-int get_valid_int(const char* prompt) {
-    int value;
-    char input[64];
-    int valid = 0;
-    
-    while (!valid) {
-        printf("%s", prompt);
-        if (scanf("%63s", input) != 1) {
-            while (getchar() != '\n'); // Clear input buffer
-            printf("[!] Invalid input. Please enter a number.\n");
+    printf("\n[*] User %d: Connected to Bank\n", user_id);
+
+    while (1)
+    {
+        print_menu(user_id);
+
+        int choice;
+        if (scanf("%d", &choice) != 1)
+        {
+            printf("[!] Invalid input\n");
+            clear_input_buffer();
             continue;
         }
-        
-        // Check if the input contains only digits
-        valid = 1;
-        for (int i = 0; input[i] != '\0'; i++) {
-            if (input[i] == '-' && i == 0) {
-                // Allow negative sign at the beginning
-                continue;
-            }
-            if (input[i] < '0' || input[i] > '9') {
-                valid = 0;
-                break;
-            }
-        }
-        
-        if (!valid) {
-            printf("[!] Invalid input. Please enter a number.\n");
-            continue;
-        }
-        
-        value = atoi(input);
-    }
-    
-    return value;
-}
+        clear_input_buffer();
 
-// ATM client session thread function
-void* atm_user_session(void* arg) {
-    ThreadData* data = (ThreadData*)arg;
-    int fd_request;
-    int choice, account_num, amount, to_account, pin;
-    char buffer[MAX_MSG_SIZE];
-    
-    pthread_mutex_lock(&io_mutex);
-    printf("\n[*] ATM Client %d Started\n", data->thread_id);
-    pthread_mutex_unlock(&io_mutex);
-    
-    while (1) {
-        pthread_mutex_lock(&io_mutex);
-        printf("\n===== ATM Menu (Client %d) =====\n", data->thread_id);
-        printf("1. Create Account\n");
-        printf("2. Deposit\n");
-        printf("3. Withdraw\n");
-        printf("4. View Balance\n");
-        printf("5. Transfer\n");
-        printf("6. Delete Account\n");
-        printf("7. Exit\n");
-        choice = get_valid_int("Select option: ");
-        pthread_mutex_unlock(&io_mutex);
-        
-        if (choice == 7) {
-            pthread_mutex_lock(&io_mutex);
-            printf("[*] Exiting ATM Client %d...\n", data->thread_id);
-            pthread_mutex_unlock(&io_mutex);
+        if (choice == 7)
+        {
+            printf("[*] Ending session...\n");
             break;
         }
-        
-        // Handle different operations
-        switch (choice) {
-            case 1: // Create Account
-                pthread_mutex_lock(&io_mutex);
-                pin = get_valid_int("Enter PIN for new account (4 digits): ");
-                
-                // Validate PIN is 4 digits
-                if (pin < 1000 || pin > 9999) {
-                    printf("[!] PIN must be a 4-digit number. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                snprintf(buffer, sizeof(buffer), "create %d", pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            case 2: // Deposit
-                pthread_mutex_lock(&io_mutex);
-                account_num = get_valid_int("Enter account number: ");
-                
-                if (account_num < 0) {
-                    printf("[!] Account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                amount = get_valid_int("Enter deposit amount: ");
-                
-                if (amount <= 0) {
-                    printf("[!] Deposit amount must be positive. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                pin = get_valid_int("Enter PIN: ");
-                snprintf(buffer, sizeof(buffer), "%d deposit %d %d", account_num, amount, pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            case 3: // Withdraw
-                pthread_mutex_lock(&io_mutex);
-                account_num = get_valid_int("Enter account number: ");
-                
-                if (account_num < 0) {
-                    printf("[!] Account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                amount = get_valid_int("Enter withdraw amount: ");
-                
-                if (amount <= 0) {
-                    printf("[!] Withdrawal amount must be positive. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                pin = get_valid_int("Enter PIN: ");
-                snprintf(buffer, sizeof(buffer), "%d withdraw %d %d", account_num, amount, pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            case 4: // View Balance
-                pthread_mutex_lock(&io_mutex);
-                account_num = get_valid_int("Enter account number: ");
-                
-                if (account_num < 0) {
-                    printf("[!] Account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                pin = get_valid_int("Enter PIN: ");
-                snprintf(buffer, sizeof(buffer), "%d view %d", account_num, pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            case 5: // Transfer
-                pthread_mutex_lock(&io_mutex);
-                account_num = get_valid_int("Enter source account number: ");
-                
-                if (account_num < 0) {
-                    printf("[!] Account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                to_account = get_valid_int("Enter target account number: ");
-                
-                if (to_account < 0) {
-                    printf("[!] Target account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                if (account_num == to_account) {
-                    printf("[!] Source and target accounts cannot be the same. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                amount = get_valid_int("Enter transfer amount: ");
-                
-                if (amount <= 0) {
-                    printf("[!] Transfer amount must be positive. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                pin = get_valid_int("Enter PIN: ");
-                snprintf(buffer, sizeof(buffer), "%d transfer %d %d %d", account_num, amount, to_account, pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            case 6: // Delete Account
-                pthread_mutex_lock(&io_mutex);
-                account_num = get_valid_int("Enter account number: ");
-                
-                if (account_num < 0) {
-                    printf("[!] Account number cannot be negative. Please try again.\n");
-                    pthread_mutex_unlock(&io_mutex);
-                    continue;
-                }
-                
-                pin = get_valid_int("Enter PIN: ");
-                snprintf(buffer, sizeof(buffer), "%d delete %d", account_num, pin);
-                pthread_mutex_unlock(&io_mutex);
-                break;
-                
-            default:
-                pthread_mutex_lock(&io_mutex);
-                printf("[!] Invalid option. Please select a number between 1 and 7.\n");
-                pthread_mutex_unlock(&io_mutex);
+        else if (choice > 7 || choice < 1)
+        {
+            printf("[!] Invalid option\n");
+            system("clear");
+            continue;
+        }
+
+        int account_index;
+        printf("Enter account index (0-4): ");
+        if (scanf("%d", &account_index) != 1 || account_index < 0 || account_index > 4)
+        {
+            printf("[!] Invalid account index\n");
+            clear_input_buffer();
+            continue;
+        }
+        clear_input_buffer();
+
+        char pin[PIN_LENGTH + 1];
+        printf("Enter PIN: ");
+        if (scanf("%4s", pin) != 1 || !validate_pin(pin))
+        {
+            printf("[!] Invalid PIN\n");
+            clear_input_buffer();
+            continue;
+        }
+        clear_input_buffer();
+
+        char request[MAX_MSG_SIZE];
+        switch (choice)
+        {
+        case 1:
+        { // Deposit
+            int amount;
+            printf("Enter amount: ");
+            if (scanf("%d", &amount) != 1 || amount <= 0)
+            {
+                printf("[!] Invalid amount\n");
+                clear_input_buffer();
                 continue;
+            }
+            clear_input_buffer();
+
+            snprintf(request, sizeof(request), "%d deposit %d %s",
+                     account_index, amount, pin);
+            break;
         }
-        
-        // Wait for mutex to ensure exclusive access to the request FIFO
-        sem_wait(&request_mutex);
-        
-        // Open request FIFO
-        fd_request = open(REQUEST_FIFO, O_WRONLY);
-        if (fd_request == -1) {
-            perror("Failed to open request FIFO");
-            sem_post(&request_mutex);
+        case 2:
+        { // Withdraw
+            int amount;
+            printf("Enter amount: ");
+            if (scanf("%d", &amount) != 1 || amount <= 0)
+            {
+                printf("[!] Invalid amount\n");
+                clear_input_buffer();
+                continue;
+            }
+            clear_input_buffer();
+
+            snprintf(request, sizeof(request), "%d withdraw %d %s",
+                     account_index, amount, pin);
+            break;
+        }
+        case 3:
+        { // View
+            snprintf(request, sizeof(request), "%d view %s", account_index, pin);
+            break;
+        }
+        case 4:
+        { // Transfer
+            int to_account, amount;
+            printf("Enter target account (0-4): ");
+            if (scanf("%d", &to_account) != 1 || to_account < 0 || to_account > 4)
+            {
+                printf("[!] Invalid target account\n");
+                clear_input_buffer();
+                continue;
+            }
+            clear_input_buffer();
+
+            printf("Enter amount: ");
+            if (scanf("%d", &amount) != 1 || amount <= 0)
+            {
+                printf("[!] Invalid amount\n");
+                clear_input_buffer();
+                continue;
+            }
+            clear_input_buffer();
+
+            snprintf(request, sizeof(request), "%d transfer %d %d %s",
+                     account_index, amount, to_account, pin);
+            break;
+        }
+        case 5:
+        { // Change PIN
+            char new_pin[PIN_LENGTH + 1];
+            printf("Enter new PIN: ");
+            if (scanf("%4s", new_pin) != 1 || !validate_pin(new_pin))
+            {
+                printf("[!] Invalid new PIN\n");
+                clear_input_buffer();
+                continue;
+            }
+            clear_input_buffer();
+
+            snprintf(request, sizeof(request), "%d changepin %s %s",
+                     account_index, pin, new_pin);
+            break;
+        }
+        case 6:
+        { // Change DOB
+            char new_dob[DOB_LENGTH];
+            printf("Enter new DOB (DD/MM/YYYY): ");
+            if (scanf("%10s", new_dob) != 1 || !validate_dob(new_dob))
+            {
+                printf("[!] Invalid DOB\n");
+                clear_input_buffer();
+                continue;
+            }
+            clear_input_buffer();
+
+            snprintf(request, sizeof(request), "%d changedob %s %s",
+                     account_index, pin, new_dob);
+            break;
+        }
+        default:
+            printf("[!] Invalid option\n");
             continue;
         }
-        
-        // Send the request
-        if (write(fd_request, buffer, strlen(buffer) + 1) == -1) {
-            perror("write");
-            close(fd_request);
-            sem_post(&request_mutex);
-            continue;
-        }
-        
-        close(fd_request);
-        sem_post(&request_mutex);
-        
-        // Wait for a short time and then read the response
-        usleep(100000); // 100ms delay to ensure server has time to process
-        read_response();
+
+        send_request(mq, request);
+        sleep(1); // Give time for bank to process
     }
-    
-    free(data);
-    return NULL;
+
+    mq_close(mq);
 }
 
-// Signal handler for graceful shutdown
-void signal_handler(int sig) {
-    if (sig == SIGINT) {
-        printf("\nCleaning up and exiting...\n");
-        sem_destroy(&request_mutex);
-        sem_destroy(&response_sem);
-        pthread_mutex_destroy(&io_mutex);
-        exit(0);
-    }
-}
+int main()
+{
+    printf("\n==============================\n");
+    printf("=== ATM CLIENT APPLICATION ===\n");
+    printf("==============================\n");
 
-int main(int argc, char *argv[]) {
-    // Set up signal handling
-    signal(SIGINT, signal_handler);
-    
-    // Check if FIFOs exist, if not create them
-    struct stat st;
-    
-    if (stat(REQUEST_FIFO, &st) == -1) {
-        if (mkfifo(REQUEST_FIFO, 0666) == -1) {
-            perror("mkfifo request");
-            exit(EXIT_FAILURE);
-        }
-    }
-    
-    if (stat(RESPONSE_FIFO, &st) == -1) {
-        if (mkfifo(RESPONSE_FIFO, 0666) == -1) {
-            perror("mkfifo response");
-            exit(EXIT_FAILURE);
-        }
-    }
-    
-    // Initialize semaphores
-    if (sem_init(&request_mutex, 0, 1) == -1) {
-        perror("sem_init request_mutex");
-        exit(EXIT_FAILURE);
-    }
-    
-    if (sem_init(&response_sem, 0, 0) == -1) {
-        perror("sem_init response_sem");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Get the number of ATM clients to simulate
-    int num_clients = 1;  // Default is 1 client
-    
-    if (argc > 1) {
-        num_clients = atoi(argv[1]);
-        if (num_clients <= 0) {
-            num_clients = 1;
-        }
-    }
-    
-    pthread_t threads[num_clients];
-    ThreadData* thread_data[num_clients];
-    
-    printf("[*] Starting %d ATM client(s)...\n", num_clients);
-    
-    // Create client threads
-    for (int i = 0; i < num_clients; i++) {
-        thread_data[i] = (ThreadData*)malloc(sizeof(ThreadData));
-        thread_data[i]->thread_id = i + 1;
-        
-        if (pthread_create(&threads[i], NULL, atm_user_session, thread_data[i]) != 0) {
-            perror("pthread_create");
-            return -1;
-        }
-    }
-    
-    // Wait for all client threads to finish
-    for (int i = 0; i < num_clients; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    // Clean up
-    sem_destroy(&request_mutex);
-    sem_destroy(&response_sem);
-    pthread_mutex_destroy(&io_mutex);
-    
+    int user_id = getpid() % 1000;
+    atm_session(user_id);
+
+    printf("\n[*] Thank you for using our ATM!\n\n");
     return 0;
 }
