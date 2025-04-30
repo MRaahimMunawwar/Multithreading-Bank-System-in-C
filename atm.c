@@ -74,9 +74,9 @@ void print_menu(int user_id)
     printf("Select option: ");
 }
 
-void send_request(mqd_t mq, const char *request)
+void send_request(mqd_t mq, const char *request, const char *req)
 {
-    printf("[*] Sending: %s\n", request);
+    printf("[*] Sending: %s\n", req);
     if (mq_send(mq, request, strlen(request) + 1, 0) == -1)
     {
         perror("[ERROR] mq_send failed");
@@ -126,6 +126,7 @@ void atm_session(int user_id)
         int account_index;
         printf("Enter account index (0-4): ");
         if (scanf("%d", &account_index) != 1 || account_index < 0 || account_index > 4)
+
         {
             printf("[!] Invalid account index\n");
             clear_input_buffer();
@@ -144,6 +145,7 @@ void atm_session(int user_id)
         clear_input_buffer();
 
         char request[MAX_MSG_SIZE];
+        char req[MAX_MSG_SIZE];
         switch (choice)
         {
         case 1:
@@ -160,6 +162,7 @@ void atm_session(int user_id)
 
             snprintf(request, sizeof(request), "%d deposit %d %s",
                      account_index, amount, pin);
+            snprintf(req, sizeof(request), "Deposit: Account Number %d ", account_index);
             break;
         }
         case 2:
@@ -176,11 +179,13 @@ void atm_session(int user_id)
 
             snprintf(request, sizeof(request), "%d withdraw %d %s",
                      account_index, amount, pin);
+            snprintf(req, sizeof(request), "Withdraw: %d ", account_index);
             break;
         }
         case 3:
         { // View
             snprintf(request, sizeof(request), "%d view %s", account_index, pin);
+            snprintf(req, sizeof(request), "View: Account Number:%d ", account_index);
             break;
         }
         case 4:
@@ -206,6 +211,7 @@ void atm_session(int user_id)
 
             snprintf(request, sizeof(request), "%d transfer %d %d %s",
                      account_index, amount, to_account, pin);
+            snprintf(req, sizeof(request), "Transfer \nAccount Number: %d ", account_index);
             break;
         }
         case 5:
@@ -222,6 +228,8 @@ void atm_session(int user_id)
 
             snprintf(request, sizeof(request), "%d changepin %s %s",
                      account_index, pin, new_pin);
+            snprintf(req, sizeof(request), "Change pin done\n Account Number: %d ",
+                     account_index);
             break;
         }
         case 6:
@@ -238,6 +246,7 @@ void atm_session(int user_id)
 
             snprintf(request, sizeof(request), "%d changedob %s %s",
                      account_index, pin, new_dob);
+            snprintf(req, sizeof(request), "Change DOB \n Account Number: %d ", account_index);
             break;
         }
         default:
@@ -245,7 +254,7 @@ void atm_session(int user_id)
             continue;
         }
 
-        send_request(mq, request);
+        send_request(mq, request, req);
         sleep(1); // Give time for bank to process
     }
 
