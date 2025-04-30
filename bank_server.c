@@ -38,6 +38,7 @@ void sigint_handler(int sig)
     {
         printf("\n[*] Received SIGINT, shutting down gracefully...\n");
         shutdown_flag = 1;
+        exit(0);
     }
 }
 
@@ -380,6 +381,7 @@ void handle_message(char *message)
 
 int main()
 {
+    signal(SIGINT, sigint_handler);
     struct mq_attr attr = {
         .mq_flags = 0,
         .mq_maxmsg = 10,
@@ -409,14 +411,17 @@ int main()
         ssize_t bytes_read = mq_receive(mq, buffer, MAX_MSG_SIZE, NULL);
         if (bytes_read >= 0)
         {
-            buffer[bytes_read] = '\0';
+            buffer[bytes_read] = '\0'; // Null-terminate the message
             printf("[*] Processing: %s\n", buffer);
             handle_message(buffer);
         }
         else
         {
-            perror("[ERROR] mq_receive");
-            sleep(1);
+            if (!shutdown_flag)
+            {
+                perror("[ERROR] mq_receive");
+                sleep(1); // avoid busy loop
+            }
         }
     }
 
